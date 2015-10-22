@@ -347,6 +347,12 @@ private:
 			valptr += lens[j];
 		}
 	}
+	template<typename Type>
+	Type get_param_by_offset(uint32_t offset)
+	{
+		return (Type)((char*)m_pevt + sizeof(struct ppm_evt_hdr) + m_info->nparams*sizeof(uint16_t)+offset);
+	}
+
 	string get_param_value_str(uint32_t id, bool resolved);
 	string get_param_value_str(const char* name, bool resolved = true);
 	char* render_fd(int64_t fd, const char** resolved_str, sinsp_evt::param_fmt fmt);
