@@ -3258,11 +3258,18 @@ void sinsp_parser::parse_context_switch(sinsp_evt* evt)
 {
 	if(evt->m_tinfo)
 	{
-		evt->m_tinfo->m_pfmajor = *evt->get_param_by_offset<uint64_t *>(sizeof(uint64_t));
-		evt->m_tinfo->m_pfminor = *evt->get_param_by_offset<uint64_t *>(2 * sizeof(uint64_t));
-		evt->m_tinfo->m_vmsize_kb = *evt->get_param_by_offset<uint32_t *>(3 * sizeof(uint64_t));
-		evt->m_tinfo->m_vmrss_kb = *evt->get_param_by_offset<uint32_t *>(3 * sizeof(uint64_t) + sizeof(uint32_t));
-		evt->m_tinfo->m_vmswap_kb = *evt->get_param_by_offset<uint32_t *>(3 * sizeof(uint64_t) + 2 * sizeof(uint32_t));
+		///////////////////////////////////////////////////////////////////////////
+		// Propagate the memory information from child thread to main thread:
+		// since memory is updated at context-switch intervals, it can happen
+		// that the "main" thread stays mostly idle, without getting memory events then
+		///////////////////////////////////////////////////////////////////////////
+
+		auto main_thread = evt->m_tinfo->get_main_thread();
+		main_thread->m_pfmajor = *evt->get_param_by_offset<uint64_t *>(sizeof(uint64_t));
+		main_thread->m_pfminor = *evt->get_param_by_offset<uint64_t *>(2 * sizeof(uint64_t));
+		main_thread->m_vmsize_kb = *evt->get_param_by_offset<uint32_t *>(3 * sizeof(uint64_t));
+		main_thread->m_vmrss_kb = *evt->get_param_by_offset<uint32_t *>(3 * sizeof(uint64_t) + sizeof(uint32_t));
+		main_thread->m_vmswap_kb = *evt->get_param_by_offset<uint32_t *>(3 * sizeof(uint64_t) + 2 * sizeof(uint32_t));
 	}
 }
 
