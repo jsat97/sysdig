@@ -22,8 +22,6 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #define VISIBILITY_PRIVATE private:
 #endif
 
-#include <tr1/unordered_map>
-
 class sinsp_delays_info;
 class sinsp_threadtable_listener;
 class thread_analyzer_info;
@@ -313,7 +311,7 @@ VISIBILITY_PRIVATE
 
 /*@}*/
 
-typedef std::tr1::unordered_map<int64_t, sinsp_threadinfo> threadinfo_map_t;
+typedef unordered_map<int64_t, sinsp_threadinfo> threadinfo_map_t;
 typedef threadinfo_map_t::iterator threadinfo_map_iterator_t;
 
 
