@@ -26,7 +26,7 @@ view_info =
 	},
 	tags = {"Default"},
 	view_type = "table",
-	applies_to = {"", "container.id", "fd.name", "fd.sport", "evt.type", "fd.directory"},
+	applies_to = {"", "container.id", "fd.name", "fd.sport", "evt.type", "fd.directory", "k8s.pod.id", "k8s.rc.id", "k8s.svc.id", "k8s.ns.id"},
 	drilldown_target = "errors",
 	filter = "container.name != host",
 	use_defaults = true,
@@ -99,6 +99,11 @@ view_info =
 			command = "docker exec -i -t %container.id /bin/bash",
 			description = "bash shell",
 			wait_finish = false
+		},
+		{
+			hotkey = "f",
+			command = "docker logs -f %container.id",
+			description = "follow logs"
 		},
 		{
 			hotkey = "h",
