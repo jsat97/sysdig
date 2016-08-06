@@ -35,6 +35,14 @@ template<> sinsp_fdinfo_t::sinsp_fdinfo()
 	m_usrstate = NULL;
 }
 
+template<> void sinsp_fdinfo_t::reset()
+{
+	m_type = SCAP_FD_UNINITIALIZED;
+	m_flags = FLAGS_NONE;
+	m_callbaks = NULL;
+	m_usrstate = NULL;
+}
+
 template<> string* sinsp_fdinfo_t::tostring()
 {
 	return &m_name;
@@ -116,7 +124,8 @@ template<> char* sinsp_fdinfo_t::get_typestring()
 template<> string sinsp_fdinfo_t::tostring_clean()
 {
 	string m_tstr = m_name;
-	m_tstr.erase(remove_if(m_tstr.begin(), m_tstr.end(), g_invalidchar()), m_tstr.end());
+	sanitize_string(m_tstr);
+
 	return m_tstr;
 }
 
@@ -126,42 +135,10 @@ template<> void sinsp_fdinfo_t::add_filename(const char* fullpath)
 }
 
 template<> bool sinsp_fdinfo_t::set_net_role_by_guessing(sinsp* inspector,
-										  sinsp_threadinfo* ptinfo, 
+										  sinsp_threadinfo* ptinfo,
 										  sinsp_fdinfo_t* pfdinfo,
 										  bool incoming)
 {
-/*
-	bool is_sip_local = 
-		inspector->get_ifaddr_list()->is_ipv4addr_in_local_machine(pfdinfo->m_sockinfo.m_ipv4info.m_fields.m_sip);
-	bool is_dip_local = 
-		inspector->get_ifaddr_list()->is_ipv4addr_in_local_machine(pfdinfo->m_sockinfo.m_ipv4info.m_fields.m_dip);
-
-	//
-	// If only the client is local, mark the role as client.
-	// If only the server is local, mark the role as server.
-	//
-	if(is_sip_local)
-	{
-		if(!is_dip_local)
-		{
-			pfdinfo->set_role_client();
-			return true;
-		}
-	}
-	else if(is_dip_local)
-	{
-		if(!is_sip_local)
-		{
-			pfdinfo->set_role_server();
-			return true;
-		}
-	}
-
-	//
-	// Both addresses are local
-	//
-	ASSERT(is_sip_local && is_dip_local);
-*/
 	//
 	// If this process owns the port, mark it as server, otherwise mark it as client
 	//
@@ -350,13 +327,13 @@ sinsp_fdinfo_t* sinsp_fdtable::add(int64_t fd, sinsp_fdinfo_t* fdinfo)
 		{
 			//
 			// Sometimes an FD-creating syscall can be called on an FD that is being closed (i.e
-			// the close enter has arrived but the close exit has not arrived yet). 
+			// the close enter has arrived but the close exit has not arrived yet).
 			// If this is the case, mark the new entry so that the successive close exit won't
 			// destroy it.
 			//
 			fdinfo->m_flags &= ~sinsp_fdinfo_t::FLAGS_CLOSE_IN_PROGRESS;
 			fdinfo->m_flags |= sinsp_fdinfo_t::FLAGS_CLOSE_CANCELED;
-			
+
 			m_table[CANCELED_FD_NUMBER] = it->second;
 		}
 		else
@@ -388,7 +365,7 @@ void sinsp_fdtable::erase(int64_t fd)
 
 	if(fd == m_last_accessed_fd)
 	{
-		m_last_accessed_fd = -1;		
+		m_last_accessed_fd = -1;
 	}
 
 	if(fdit == m_table.end())

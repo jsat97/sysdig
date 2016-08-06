@@ -118,7 +118,6 @@ static void record_event_all_consumers(enum ppm_event_type event_type,
 	struct event_data_t *event_datap);
 static int init_ring_buffer(struct ppm_ring_buffer_context *ring);
 static void free_ring_buffer(struct ppm_ring_buffer_context *ring);
-static ssize_t ppe_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
 void ppm_task_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st);
 
 #ifndef CONFIG_HAVE_SYSCALL_TRACEPOINTS
@@ -131,8 +130,10 @@ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p);
 #ifdef CAPTURE_CONTEXT_SWITCHES
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35))
 TRACEPOINT_PROBE(sched_switch_probe, struct rq *rq, struct task_struct *prev, struct task_struct *next);
-#else
+#elif (LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0))
 TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struct *next);
+#else
+TRACEPOINT_PROBE(sched_switch_probe, bool preempt, struct task_struct *prev, struct task_struct *next);
 #endif /* (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)) */
 #endif /* CAPTURE_CONTEXT_SWITCHES */
 
@@ -145,17 +146,12 @@ static struct ppm_device *g_ppm_devs;
 static struct class *g_ppm_class;
 static unsigned int g_ppm_numdevs;
 static int g_ppm_major;
+bool g_tracers_enabled = false;
 static const struct file_operations g_ppm_fops = {
 	.open = ppm_open,
 	.release = ppm_release,
 	.mmap = ppm_mmap,
 	.unlocked_ioctl = ppm_ioctl,
-	.owner = THIS_MODULE,
-};
-
-/* Events file operations */
-static const struct file_operations g_ppe_fops = {
-	.write = ppe_write,
 	.owner = THIS_MODULE,
 };
 
@@ -166,13 +162,9 @@ LIST_HEAD(g_consumer_list);
 static DEFINE_MUTEX(g_consumer_mutex);
 static bool g_tracepoint_registered;
 
-struct cdev *g_ppe_cdev = NULL;
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 static struct tracepoint *tp_sys_enter;
 static struct tracepoint *tp_sys_exit;
-struct device *g_ppe_dev = NULL;
-#else
-struct class_device *g_ppe_dev = NULL;
 #endif
 
 static struct tracepoint *tp_sched_process_exit;
@@ -239,6 +231,7 @@ static void check_remove_consumer(struct ppm_consumer_t *consumer, int remove_fr
 
 	for_each_possible_cpu(cpu) {
 		struct ppm_ring_buffer_context *ring = per_cpu_ptr(consumer->ring_buffers, cpu);
+
 		if (ring && ring->open)
 			++open_rings;
 	}
@@ -260,7 +253,6 @@ static void check_remove_consumer(struct ppm_consumer_t *consumer, int remove_fr
 
 		free_percpu(consumer->ring_buffers);
 
-		kfree(consumer->proclist_info);
 		vfree(consumer);
 	}
 }
@@ -317,7 +309,6 @@ static int ppm_open(struct inode *inode, struct file *filp)
 		}
 
 		consumer->consumer_id = consumer_id;
-		consumer->proclist_info = NULL;
 
 		/*
 		 * Initialize the ring buffers array
@@ -591,6 +582,101 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	struct task_struct *consumer_id = filp->private_data;
 	struct ppm_consumer_t *consumer = NULL;
 
+	if (cmd == PPM_IOCTL_GET_PROCLIST) {
+		struct ppm_proclist_info *proclist_info = NULL;
+		struct task_struct *p, *t;
+		u64 nentries = 0;
+		struct ppm_proclist_info pli;
+		u32 memsize;
+
+		if (copy_from_user(&pli, (void *)arg, sizeof(pli))) {
+			ret = -EINVAL;
+			goto cleanup_ioctl_nolock;
+		}
+
+		vpr_info("PPM_IOCTL_GET_PROCLIST, size=%d\n", (int)pli.max_entries);
+
+		memsize = sizeof(struct ppm_proclist_info) + sizeof(struct ppm_proc_info) * pli.max_entries;
+		proclist_info = kmalloc(memsize, GFP_KERNEL);
+		if (!proclist_info) {
+			ret = -EINVAL;
+			goto cleanup_ioctl_nolock;
+		}
+
+		proclist_info->max_entries = pli.max_entries;
+
+		rcu_read_lock();
+
+#ifdef for_each_process_thread
+		for_each_process_thread(p, t) {
+#else
+#ifdef for_each_process_all
+		for_each_process_all(p) {
+#else
+		for_each_process(p) {
+#endif
+			t = p;
+			do {
+				task_lock(p);
+#endif
+				if (nentries < pli.max_entries) {
+					cputime_t utime, stime;
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0))
+					task_cputime_adjusted(t, &utime, &stime);
+#else
+					ppm_task_cputime_adjusted(t, &utime, &stime);
+#endif
+					proclist_info->entries[nentries].pid = t->pid;
+					proclist_info->entries[nentries].utime = cputime_to_clock_t(utime);
+					proclist_info->entries[nentries].stime = cputime_to_clock_t(stime);
+				}
+
+				nentries++;
+#ifdef for_each_process_thread
+		}
+#else
+				task_unlock(p);
+#ifdef while_each_thread_all
+			} while_each_thread_all(p, t);
+		}
+#else
+			} while_each_thread(p, t);
+		}
+#endif
+#endif
+
+		rcu_read_unlock();
+
+		proclist_info->n_entries = nentries;
+
+		if (nentries >= pli.max_entries) {
+			vpr_info("PPM_IOCTL_GET_PROCLIST: not enough space (%d avail, %d required)\n",
+				(int)pli.max_entries,
+				(int)nentries);
+
+			if (copy_to_user((void *)arg, proclist_info, sizeof(struct ppm_proclist_info))) {
+				ret = -EINVAL;
+				goto cleanup_ioctl_procinfo;
+			}
+
+			ret = -ENOSPC;
+			goto cleanup_ioctl_procinfo;
+		} else {
+			memsize = sizeof(struct ppm_proclist_info) + sizeof(struct ppm_proc_info) * nentries;
+
+			if (copy_to_user((void *)arg, proclist_info, memsize)) {
+				ret = -EINVAL;
+				goto cleanup_ioctl_procinfo;
+			}
+		}
+
+		ret = 0;
+cleanup_ioctl_procinfo:
+		kfree(proclist_info);
+		goto cleanup_ioctl_nolock;
+	}
+
 	mutex_lock(&g_consumer_mutex);
 
 	consumer = ppm_find_consumer(consumer_id);
@@ -609,6 +695,7 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		int ring_no = iminor(filp->f_dentry->d_inode);
 #endif
 		struct ppm_ring_buffer_context *ring = per_cpu_ptr(consumer->ring_buffers, ring_no);
+
 		if (!ring) {
 			ASSERT(false);
 			return -ENODEV;
@@ -629,6 +716,7 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		int ring_no = iminor(filp->f_dentry->d_inode);
 #endif
 		struct ppm_ring_buffer_context *ring = per_cpu_ptr(consumer->ring_buffers, ring_no);
+
 		if (!ring) {
 			ASSERT(false);
 			return -ENODEV;
@@ -840,92 +928,10 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		goto cleanup_ioctl;
 	}
 #endif
-	case PPM_IOCTL_GET_PROCLIST:
+	case PPM_IOCTL_SET_TRACERS_CAPTURE:
 	{
-		struct task_struct *p, *t;
-		u64 nentries = 0;
-		struct ppm_proclist_info pli;
-		u32 memsize;
-
-		if (copy_from_user(&pli, (void *)arg, sizeof(pli))) {
-			ret = -EINVAL;
-			goto cleanup_ioctl;
-		}
-
-		vpr_info("PPM_IOCTL_GET_PROCLIST, size=%d\n", (int)pli.max_entries);
-
-		if (consumer->proclist_info == NULL || consumer->proclist_info->max_entries != pli.max_entries) {
-			if (consumer->proclist_info != NULL)
-				kfree(consumer->proclist_info);
-
-			memsize = sizeof(struct ppm_proclist_info) + sizeof(struct ppm_proc_info) * pli.max_entries;
-			consumer->proclist_info = kmalloc(memsize, GFP_KERNEL);
-			if (!consumer->proclist_info) {
-				ret = -EINVAL;
-				goto cleanup_ioctl;
-			}
-
-			consumer->proclist_info->max_entries = pli.max_entries;
-		}
-
-		rcu_read_lock();
-
-#ifdef for_each_process_thread
-		for_each_process_thread(p, t) {
-#else
-		for_each_process(p) {
-			t = p;
-			do {
-				task_lock(p);
-#endif
-				if (nentries < pli.max_entries) {
-					cputime_t utime, stime;
-
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0))
-					utime = t->utime;
-					stime = t->stime;
-#else
-					ppm_task_cputime_adjusted(t, &utime, &stime);
-#endif
-					consumer->proclist_info->entries[nentries].pid = t->pid;
-					consumer->proclist_info->entries[nentries].utime = cputime_to_clock_t(utime);
-					consumer->proclist_info->entries[nentries].stime = cputime_to_clock_t(stime);
-				}
-
-				nentries++;
-#ifdef for_each_process_thread
-		}
-#else
-				task_unlock(p);
-			} while_each_thread(p, t);
-		}
-#endif
-
-		rcu_read_unlock();
-
-		consumer->proclist_info->n_entries = nentries;
-
-		if (nentries >= pli.max_entries) {
-			vpr_info("PPM_IOCTL_GET_PROCLIST: not enough space (%d avail, %d required)\n",
-				(int)pli.max_entries,
-				(int)nentries);
-
-			if (copy_to_user((void *)arg, consumer->proclist_info, sizeof(struct ppm_proclist_info))) {
-				ret = -EINVAL;
-				goto cleanup_ioctl;
-			}
-
-			ret = -ENOSPC;
-			goto cleanup_ioctl;
-		} else {
-			memsize = sizeof(struct ppm_proclist_info) + sizeof(struct ppm_proc_info) * nentries;
-
-			if (copy_to_user((void *)arg, consumer->proclist_info, memsize)) {
-				ret = -EINVAL;
-				goto cleanup_ioctl;
-			}
-		}
-
+		vpr_info("PPM_IOCTL_SET_TRACERS_CAPTURE, consumer %p\n", consumer_id);
+		g_tracers_enabled = true;
 		ret = 0;
 		goto cleanup_ioctl;
 	}
@@ -936,7 +942,7 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 cleanup_ioctl:
 	mutex_unlock(&g_consumer_mutex);
-
+cleanup_ioctl_nolock:
 	return ret;
 }
 
@@ -1101,11 +1107,6 @@ cleanup_mmap:
 	mutex_unlock(&g_consumer_mutex);
 
 	return ret;
-}
-
-static ssize_t ppe_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
-{
-	return count;
 }
 
 /* Argument list sizes for sys_socketcall */
@@ -1353,9 +1354,8 @@ static int record_event_consumer(struct ppm_consumer_t *consumer,
 			ring_info->n_context_switches++;
 		}
 	} else if (event_datap->category == PPMC_SIGNAL) {
-		if (event_type == PPME_SIGNALDELIVER_E) {
+		if (event_type == PPME_SIGNALDELIVER_E)
 			ASSERT(event_datap->event_info.signal_data.info != NULL);
-		}
 	}
 
 	/*
@@ -1761,8 +1761,10 @@ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p)
 #ifdef CAPTURE_CONTEXT_SWITCHES
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35))
 TRACEPOINT_PROBE(sched_switch_probe, struct rq *rq, struct task_struct *prev, struct task_struct *next)
-#else
+#elif (LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0))
 TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struct *next)
+#else
+TRACEPOINT_PROBE(sched_switch_probe, bool preempt, struct task_struct *prev, struct task_struct *next)
 #endif
 {
 	struct event_data_t event_data;
@@ -2056,7 +2058,11 @@ int sysdig_init(void)
 
 	g_ppm_major = MAJOR(dev);
 	g_ppm_numdevs = num_cpus;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
 	g_ppm_devs = kmalloc(g_ppm_numdevs * sizeof(struct ppm_device), GFP_KERNEL);
+#else	
+	g_ppm_devs = kmalloc_array(g_ppm_numdevs, sizeof(struct ppm_device), GFP_KERNEL);
+#endif
 	if (!g_ppm_devs) {
 		pr_err("can't allocate devices\n");
 		ret = -ENOMEM;
@@ -2100,48 +2106,17 @@ int sysdig_init(void)
 
 	/* create_proc_read_entry(PPM_DEVICE_NAME, 0, NULL, ppm_read_proc, NULL); */
 
-	g_ppe_cdev = cdev_alloc();
-	if (g_ppe_cdev == NULL) {
-		pr_err("error allocating the device %s\n", PROBE_EVENT_DEVICE_NAME);
-		ret = -ENOMEM;
-		goto init_module_err;
-	}
-
-	cdev_init(g_ppe_cdev, &g_ppe_fops);
-
-	if (cdev_add(g_ppe_cdev, MKDEV(g_ppm_major, g_ppm_numdevs), 1) < 0) {
-		pr_err("could not allocate chrdev for %s\n", PROBE_EVENT_DEVICE_NAME);
-		ret = -EFAULT;
-		goto init_module_err;
-	}
-
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
-	g_ppe_dev = device_create(
-#else
-	g_ppe_dev = class_device_create(
-#endif
-			g_ppm_class, NULL,
-			MKDEV(g_ppm_major, g_ppm_numdevs),
-			NULL, /* no additional data */
-			PROBE_EVENT_DEVICE_NAME);
-
-	if (IS_ERR(g_ppe_dev)) {
-		pr_err("error creating the device for %s\n", PROBE_EVENT_DEVICE_NAME);
-		ret = -EFAULT;
-		goto init_module_err;
-	}
-
 	/*
 	 * Snaplen lookahead initialization
 	 */
 	if (dpi_lookahead_init() != PPM_SUCCESS) {
-		pr_err("initializing lookahead-based snaplen  %s\n", PROBE_EVENT_DEVICE_NAME);
+		pr_err("initializing lookahead-based snaplen failed\n");
 		ret = -EFAULT;
 		goto init_module_err;
 	}
 
 	/*
-	 * Set up our callback in case we get a hotplug even while we are 
+	 * Set up our callback in case we get a hotplug even while we are
 	 * initializing the cpu structures
 	 */
 	register_cpu_notifier(&cpu_notifier);
@@ -2154,12 +2129,6 @@ int sysdig_init(void)
 	return 0;
 
 init_module_err:
-	if (g_ppe_dev != NULL)
-		device_destroy(g_ppm_class, MKDEV(g_ppm_major, g_ppm_numdevs));
-
-	if (g_ppe_cdev != NULL)
-		cdev_del(g_ppe_cdev);
-
 	for (j = 0; j < n_created_devices; ++j) {
 		device_destroy(g_ppm_class, g_ppm_devs[j].dev);
 		cdev_del(&g_ppm_devs[j].cdev);
@@ -2186,12 +2155,6 @@ void sysdig_exit(void)
 		device_destroy(g_ppm_class, g_ppm_devs[j].dev);
 		cdev_del(&g_ppm_devs[j].cdev);
 	}
-
-	if (g_ppe_dev != NULL)
-		device_destroy(g_ppm_class, MKDEV(g_ppm_major, g_ppm_numdevs));
-
-	if (g_ppe_cdev != NULL)
-		cdev_del(g_ppe_cdev);
 
 	if (g_ppm_class)
 		class_destroy(g_ppm_class);
